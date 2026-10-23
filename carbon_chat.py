@@ -5,7 +5,7 @@ RUN
     python3 carbon_chat.py
     # Enter a Runpod API key at the hidden prompt, or set RUNPOD_API_KEY.
     python3 carbon_chat.py --share   # also print a guest chat link
-    python3 carbon_chat.py --stop    # remove this installation's leftover Pods
+    python3 carbon_chat.py --stop    # show this installation's retained Pods
     python3 carbon_chat.py --check   # read-only checks; does not rent a GPU
     python3 carbon_chat.py --version # show the launcher version
     python3 carbon_chat.py --demo    # UI preview; no cloud, no model, no charges
@@ -17,8 +17,8 @@ be off. This program never changes your payment settings or adds funds.
 
 DEFAULTS
 Official Carbon-X Q8_0; 8192-token context shared by one request; thinking off;
-15-minute idle shutdown; 4-hour maximum session INCLUDING setup; 20-minute
-startup timeout; GPU price ceiling $0.40/hour. Prices are queried before renting
+15-minute idle model shutdown; 4-hour maximum session INCLUDING setup; no startup
+timeout; GPU price ceiling $0.40/hour. Prices are queried before renting
 and checked again immediately afterward. Storage is estimated separately.
 
 The operating allowance is $15 per UTC calendar month, leaving $5 of the user's
@@ -29,20 +29,20 @@ state, concurrent launches from other computers, API failures, image startup
 failures, and billing delays can defeat application-level controls. Keep auto-pay
 off and limit prepaid credit. Do not delete the ledger to reset your allowance.
 
-The Pod is DELETED at shutdown, including its temporary model download. There
-are no persistent cloud volumes. The 15.8 GB model downloads each session; setup
-is billable. Owner chats are saved locally in the state directory, with file mode
+The Pod is NEVER deleted by this launcher. After the model or launcher stops,
+the Pod remains in Runpod for inspection and may keep accruing charges until you
+stop or delete it yourself. There are no persistent cloud volumes. The 15.8 GB
+model downloads each new Pod; setup is billable. Owner chats are saved locally in the state directory, with file mode
 0600. Guest chats stay in their own browser and should be exported before the
 session ends; the share URL changes between sessions. Chat history is sent to
 the model every turn. Overlong conversations are rejected, never silently cut.
 
-The Runpod key is held in local memory AND passed to the private Pod environment
-for its self-deletion watchdog. It is never sent to browser JavaScript or guests,
+The Runpod key is held in local memory and passed to the private Pod environment
+to verify Pod ownership. It is never sent to browser JavaScript or guests,
 written to the local ledger, or inherited by llama-server. Use a dedicated key.
-The watchdog starts only after the container boots. Local monitoring covers
-image-pull/startup failures while this launcher is running. Ctrl-C and End session
-delete the Pod. A failed deletion is reported and retried; verify in Runpod if
-the launcher cannot confirm cleanup. Only Pods with this installation's exact
+Local monitoring covers image-pull/startup failures while this launcher is
+running. Ctrl-C and End session stop the local chat session but retain the Pod in Runpod. Use the Runpod console
+to stop or delete it when you choose. Only Pods with this installation's exact
 name and ownership marker are managed.
 
 All model text is rendered literally, including DNA tags and code. No remote
@@ -88,7 +88,7 @@ import urllib.request
 import webbrowser
 import zlib
 
-VERSION = "1.1.0"
+VERSION = "1.3.0"
 REST = "https://api.runpod.io/v2"
 GRAPHQL = "https://api.runpod.io/graphql"
 MODEL_REPO = "HuggingFaceBio/Carbon-X-GGUF"
@@ -97,7 +97,6 @@ MODEL_FILE = "carbon-x-q8_0.gguf"
 MODEL_SHA256 = "48241178b67ab5423a74f65552dd04628ac16f2fa5d1a60dc94019d86fa6f453"
 MODEL_BYTES = 15755742080
 MODEL_URL = f"https://huggingface.co/{MODEL_REPO}/resolve/{MODEL_REVISION}/{MODEL_FILE}"
-MIN_LLAMA_BUILD = 11742
 # Official linux/amd64 full-CUDA image, llama.cpp b11804, CUDA 12.8.1.
 # Keep deployments reproducible instead of pulling a changing latest tag.
 IMAGE_DIGEST = "sha256:0f5ab9182a7fce171f73226373627424303886f23b5457e2353ed139b098cc9d"
@@ -213,7 +212,7 @@ def iso_time(ts):
 
 
 class Ledger:
-    """Reserve an entire session before creation; reconcile only confirmed cleanup."""
+    """Reserve an entire session before creation; retained Pods keep reservations open."""
     def __init__(self, directory):
         self.path = Path(directory) / "ledger.json"
         self.data = read_json(self.path)
@@ -388,71 +387,12 @@ class Runpod:
             seen.add(cursor)
 
     def delete(self, pod_id):
-        if not re.fullmatch(r"[a-zA-Z0-9_-]+", pod_id):
-            raise AppError("Invalid Pod identifier.")
-        try:
-            self.rest("/pods/" + pod_id, method="DELETE")
-        except HttpError as exc:
-            if exc.code != 404:
-                raise
-        # Confirm the object is gone/terminated, not merely that DELETE was accepted.
-        for _ in range(8):
-            try:
-                pod = self.rest("/pods/" + pod_id)
-                if isinstance(pod, dict) and pod.get("status") == "TERMINATED":
-                    return
-            except HttpError as exc:
-                if exc.code == 404:
-                    return
-                raise
-            time.sleep(1)
-        raise AppError("Runpod has not yet confirmed termination.")
-
-
-def verify_model():
-    meta = get_json(f"https://huggingface.co/api/models/{MODEL_REPO}/revision/{MODEL_REVISION}?blobs=true")
-    rows = [v for v in meta.get("siblings", []) if v.get("rfilename") == MODEL_FILE]
-    if (meta.get("sha") != MODEL_REVISION or meta.get("private") or meta.get("gated") or
-            len(rows) != 1 or rows[0].get("lfs", {}).get("sha256") != MODEL_SHA256 or
-            rows[0].get("size") != MODEL_BYTES):
-        raise AppError("The pinned public Carbon-X model could not be verified; no Pod created.")
-
-
-def resolve_image():
-    """Verify the pinned official CUDA image before GPU billing."""
-    scope = urllib.parse.urlencode({"service": "ghcr.io", "scope": "repository:ggml-org/llama.cpp:pull"})
-    auth = get_json("https://ghcr.io/token?" + scope).get("token")
-    if not auth:
-        raise AppError("Could not read the public llama.cpp image registry.")
-    accept = "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
-
-    def registry(path):
-        req = urllib.request.Request("https://ghcr.io/v2/ggml-org/llama.cpp/" + path,
-            headers={"Authorization": "Bearer " + auth, "Accept": accept, "User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=30) as response:
-            raw = response.read(4 * 1024 * 1024)
-            return json.loads(raw), "sha256:" + hashlib.sha256(raw).hexdigest()
-
-    try:
-        manifest, digest = registry("manifests/" + IMAGE_DIGEST)
-        config, config_digest = registry("blobs/" + manifest["config"]["digest"])
-        version = str(config.get("config", {}).get("Labels", {}).get("org.opencontainers.image.version", ""))
-        match = re.search(r"(?:^|\D)(\d{4,})(?:\D|$)", version)
-        if (digest != IMAGE_DIGEST or config_digest != manifest["config"]["digest"] or
-                config.get("architecture") != "amd64" or config.get("os") != "linux" or
-                "CUDA_VERSION=12.8.1" not in config.get("config", {}).get("Env", []) or
-                not match or int(match[1]) < MIN_LLAMA_BUILD):
-            raise AppError("Pinned CUDA image verification failed; no Pod created.")
-        return "ghcr.io/ggml-org/llama.cpp@" + digest
-    except urllib.error.HTTPError as exc:
-        raise AppError(f"Image registry returned HTTP {exc.code}; no Pod created.") from None
-    except (urllib.error.URLError, TimeoutError, ValueError, KeyError):
-        raise AppError("Could not verify the pinned official CUDA image; no Pod created.") from None
+        raise AppError("Pod deletion is disabled in this launcher. Manage it in Runpod.")
 
 
 def actual_rate(pod):
     if not isinstance(pod, dict) or pod.get("cost") is None:
-        raise AppError("Runpod did not return an hourly price; cleaning up the Pod.")
+        raise AppError("Runpod did not return an hourly price; the created Pod is retained for inspection.")
     # v2 reports the effective hourly rate as cost. Reserve disk separately too.
     return finite_number(pod["cost"], "Pod hourly price", positive=True) + DISK_RATE
 
@@ -746,25 +686,16 @@ class Worker:
             try:
                 self.process.terminate()
             except OSError:
-                pass  # A model-exit race must never prevent Pod deletion.
-        print("Stopping Carbon-X Pod: " + reason, flush=True)
-        while True:
-            try:
-                self.api.delete(self.pod_id)
-                self.phase = "stopped"
-                return
-            except AppError:
-                print("Termination not confirmed; retrying. Check Runpod console if this persists.", flush=True)
-                time.sleep(10)
+                pass  # The Pod is retained even if the model process is already exiting.
+        self.phase = "stopped"
+        self.message = reason + ". Pod retained in Runpod; manage it there."
+        print("Carbon-X worker stopped; Pod retained in Runpod: " + reason, flush=True)
 
     def watchdog(self):
         while self.phase not in ("stopping", "stopped"):
             now = time.time()
             if now >= self.settings["deadline"]:
                 self.end("Maximum session duration reached")
-                return
-            if self.ready_at is None and now >= self.settings["startup_deadline"]:
-                self.end("Model startup timed out")
                 return
             if self.ready_at is not None and not self.active and time.monotonic() - self.last_activity >= self.settings["idle_seconds"]:
                 self.end("No chat activity for 15 minutes" if self.settings["idle_seconds"] == 900 else "Idle timeout reached")
@@ -783,11 +714,6 @@ class Worker:
             rate = actual_rate(pod)
             if rate > self.settings["max_rate"]:
                 raise AppError("Assigned Pod exceeds the price ceiling")
-            check = subprocess.run(["/app/llama-server", "--version"], capture_output=True, text=True, timeout=30)
-            text = check.stdout + check.stderr
-            found = re.search(r"(?:version:|build:)\s*b?(\d+)", text)
-            if check.returncode or not found or int(found[1]) < MIN_LLAMA_BUILD:
-                raise AppError("llama.cpp build is too old or could not be verified")
             model = self.model_dir / MODEL_FILE
             digest, received, last_progress = hashlib.sha256(), 0, 0.0
             self.message = "Downloading Carbon-X (15.8 GB); setup time is billable"
@@ -833,9 +759,6 @@ class Worker:
                     if self.process.poll() is not None:
                         raise
                 if healthy:
-                    self.message = "Checking DNA tokenization and chat generation"
-                    self.tokenizer_check()
-                    self.inference_check()
                     if self.phase in ("stopping", "stopped"):
                         return
                     self.ready_at = time.time()
@@ -851,31 +774,6 @@ class Worker:
                 except OSError:
                     pass
             self.end(reason)
-
-    def tokenizer_check(self):
-        # The long canonical DNA segment must use 6-mers rather than text BPE.
-        dna = "ACGTTGCAATGCCGTA" * 60
-        obj = get_json(self.llama + "/tokenize", method="POST", data={"content": "<dna>" + dna + "</dna>", "add_special": False, "parse_special": True}, timeout=20)
-        tokens = obj.get("tokens", [])
-        if not isinstance(tokens, list) or not 155 <= len(tokens) <= 180:
-            raise AppError("DNA tokenizer sanity check failed; refusing to serve")
-
-    def inference_check(self):
-        # Exercise the same chat-template/token-count path before showing Ready.
-        payload = {"model": "carbon-x", "messages": [
-            {"role": "user", "content": "Remember this test word: maple."},
-            {"role": "assistant", "content": "The test word is maple."},
-            {"role": "user", "content": "Repeat the test word, with no explanation."}],
-            "max_tokens": 16, "temperature": 0, "stream": False,
-            "chat_template_kwargs": {"enable_thinking": False}}
-        counts = get_json(self.llama + "/v1/chat/completions/input_tokens", method="POST", data=payload, timeout=30)
-        if not isinstance(counts, dict) or not 0 < finite_number(counts.get("input_tokens"), "prompt token count") < CONTEXT - 64:
-            raise AppError("Chat token-count startup check failed")
-        reply = get_json(self.llama + "/v1/chat/completions", method="POST", data=payload, timeout=90)
-        choices = reply.get("choices") if isinstance(reply, dict) else None
-        content = choices[0].get("message", {}).get("content") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else None
-        if not isinstance(content, str) or not content.strip():
-            raise AppError("Model produced no text in its startup chat check")
 
     def chat(self, handler, messages, role):
         if self.phase != "ready":
@@ -989,26 +887,10 @@ class Local:
                 self.phase, self.message = "stopped", "Preview ended"
                 self.stopped.set()
                 return
-            pod_id = self.entry.get("pod_id") if self.entry else None
-            if not pod_id:
-                raise AppError("Creation result is uncertain. Rerun with --stop to reconcile this installation's Pods.")
-            for attempt in range(6):
-                try:
-                    self.api.delete(pod_id)
-                    try:
-                        self.ledger.close(self.entry)
-                    except (OSError, AppError):
-                        print("WARNING: Pod deletion confirmed, but the local spending ledger could not be saved. Preserve your state directory.", file=sys.stderr, flush=True)
-                    self.phase, self.message = "stopped", reason + ". Pod termination confirmed; chats are saved."
-                    self.stopped.set()
-                    print(self.message, flush=True)
-                    return
-                except AppError:
-                    if attempt == 5:
-                        break
-                    time.sleep(2)
-            self.message = "Cleanup could not be confirmed. Check https://console.runpod.io/pods and run this script with --stop."
-            print("WARNING: " + self.message, file=sys.stderr, flush=True)
+            suffix = ". Pod retained in Runpod"
+            self.phase, self.message = "stopped", reason + ("" if suffix in reason else suffix) + "; chats are saved locally."
+            self.stopped.set()
+            print(self.message, flush=True)
         finally:
             self.end_lock.release()
 
@@ -1029,15 +911,8 @@ def recover(api, ledger):
     # Do not infer ownership from a broad prefix: the name AND random marker match.
     pods = api.owned(ledger.name, ledger.data["installation"])
     for pod in pods:
-        print("Removing this launcher's previous Pod " + pod["id"], flush=True)
-        api.delete(pod["id"])
-    for entry in ledger.data["sessions"]:
-        if not entry.get("closed"):
-            # Retain the full reservation for uncertain prior uptime, even if gone.
-            entry["closed"] = True
-            if time.time() > entry["deadline"]:
-                entry["end"] = time.time() + 120 if any(p["id"] == entry.get("pod_id") for p in pods) else entry["deadline"]
-    ledger.save()
+        print("Retained Pod " + pod["id"] + " (" + str(pod.get("desiredStatus", pod.get("status", "status unknown"))) + ")", flush=True)
+    return pods
 
 
 def monitor(app):
@@ -1046,8 +921,6 @@ def monitor(app):
         now = time.time()
         if now >= app.settings["deadline"]:
             app.end("Maximum session duration reached")
-        if now >= app.settings["startup_deadline"] and app.phase == "starting":
-            app.end("Startup timed out")
         if app.phase in ("stopping", "stopped"):
             if not app.stopped.is_set():
                 app.end(app.stop_reason or "Retrying Pod cleanup")
@@ -1098,15 +971,15 @@ def monitor(app):
 
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="Launch Carbon-X chat on a disposable Runpod GPU. Python standard library only.", epilog="Budget: $15 operating allowance per UTC month, reserving $5 of a $20 budget. See this file's opening documentation for billing limitations.")
+    p = argparse.ArgumentParser(description="Launch Carbon-X chat on Runpod. The launcher retains Pods for manual inspection. Python standard library only.", epilog="Budget: $15 operating allowance per UTC month, reserving $5 of a $20 budget. See this file's opening documentation for billing limitations.")
     p.add_argument("--version", action="version", version="Carbon-X launcher " + VERSION)
     mode = p.add_mutually_exclusive_group()
-    mode.add_argument("--stop", action="store_true", help="delete this installation's leftover Pods")
+    mode.add_argument("--stop", action="store_true", help="list this installation's retained Pods; does not delete them")
     mode.add_argument("--check", action="store_true", help="verify prices, model and image; do not create a Pod")
     mode.add_argument("--demo", action="store_true", help="preview the UI without cloud access or inference")
     p.add_argument("--share", action="store_true", help="enable a separate guest link while this Pod runs")
     p.add_argument("--max-gpu-price", type=float, default=0.40, help="maximum GPU USD/hour (default: 0.40)")
-    p.add_argument("--idle-minutes", type=int, default=15, help="shutdown after no user activity (default: 15)")
+    p.add_argument("--idle-minutes", type=int, default=15, help="stop the model after no user activity; the Pod is retained (default: 15)")
     p.add_argument("--session-hours", type=float, default=4, help="maximum session including startup (default: 4)")
     p.add_argument("--port", type=int, default=8765, help="local browser UI port (default: 8765)")
     p.add_argument("--no-browser", action="store_true", help="print the local URL without opening a browser")
@@ -1153,14 +1026,19 @@ def local_main(argv=None):
                 raise AppError("A Runpod API key is required.")
             api, ledger = Runpod(key), Ledger(directory)
             if args.stop:
-                recover(api, ledger)
-                print("Cleanup confirmed for this installation. Your local chats are preserved.")
+                pods = recover(api, ledger)
+                if not pods:
+                    print("No retained Pods found for this installation.")
+                else:
+                    print("No Pods were deleted. Stop or delete them yourself in the Runpod console.")
                 return 0
             if args.check:
                 if api.owned(ledger.name, ledger.data["installation"]):
-                    raise AppError("A previous Pod exists. Run --stop before another launch.")
+                    raise AppError("A retained Pod exists. Inspect it in Runpod and stop/delete it manually before launching another.")
             else:
-                recover(api, ledger)
+                previous = recover(api, ledger)
+                if previous:
+                    raise AppError("Retained Pods were found and have not been changed. Inspect them in Runpod; stop/delete one manually before launching another.")
             print("Checking account balance, monthly spend, and live GPU prices…", flush=True)
             balance = api.account()
             reported = api.billing()
@@ -1179,9 +1057,8 @@ def local_main(argv=None):
                 raise AppError("Runpod requires at least one hour of credit to deploy. Add credit within your budget.")
             print(f"Selected {choice['name']} ({choice['cloud'].lower()}): quoted GPU ${choice['rate']:.3f}/hour + estimated disk ${DISK_RATE:.3f}/hour.", flush=True)
             print(f"Monthly spend/reservations: ${used:.2f}; operating allowance remaining: ${max(0, ALLOWANCE-used):.2f}.", flush=True)
-            print("Verifying the pinned model and a compatible official CUDA image…", flush=True)
-            verify_model()
-            image = resolve_image()
+            print("Using the pinned Carbon-X model and CUDA image…", flush=True)
+            image = "ghcr.io/ggml-org/llama.cpp@" + IMAGE_DIGEST
             if args.check:
                 print("Preflight passed. No Pod created and no GPU charges incurred.")
                 return 0
@@ -1194,7 +1071,7 @@ def local_main(argv=None):
             entry = ledger.reserve(start, deadline + 120, max_rate)
             settings = {"owner": owner, "guest": secrets.token_urlsafe(32) if args.share else "",
                         "installation": ledger.data["installation"], "deadline": deadline,
-                        "startup_deadline": min(deadline, start + 1200), "idle_seconds": args.idle_minutes * 60,
+                        "idle_seconds": args.idle_minutes * 60,
                         "rate": choice["rate"] + DISK_RATE, "max_rate": max_rate}
             app = Local(directory, owner, api, ledger, entry, settings)
             source = Path(__file__).read_text()
@@ -1212,10 +1089,10 @@ def local_main(argv=None):
             entry["pod_id"] = pod_id
             ledger.save()
             if pod.get("mounts"):
-                raise AppError("Runpod attached unexpected persistent storage; cleaning up the Pod.")
+                raise AppError("Runpod attached unexpected persistent storage. The Pod is retained for inspection.")
             rate = actual_rate(pod)
             if rate > max_rate:
-                raise AppError(f"Assigned price ${rate:.3f}/hour exceeds the ${max_rate:.3f} ceiling. Cleaning up.")
+                raise AppError(f"Assigned price ${rate:.3f}/hour exceeds the ${max_rate:.3f} ceiling. The Pod is retained for inspection; stop it in Runpod.")
             entry["rate"] = rate
             ledger.save()
             settings["rate"] = rate
@@ -1229,7 +1106,7 @@ def local_main(argv=None):
         server_started = True
         url = f"http://127.0.0.1:{args.port}/#access={owner}"
         print("Chat: " + url, flush=True)
-        print("Keep this terminal running. Ctrl-C or End session removes the Pod. Chats stay on this computer.", flush=True)
+        print("Keep this terminal running to use chat. Ctrl-C or End session leaves the Pod in Runpod. Chats stay on this computer.", flush=True)
         if not args.no_browser:
             webbrowser.open(url)
         while not app.stopped.wait(0.5):
@@ -1242,7 +1119,7 @@ def local_main(argv=None):
         print("\nClosing session…", flush=True)
     finally:
         # Ctrl-C/SIGTERM can arrive after Runpod accepts POST but before the ID
-        # reaches us. Reconcile this case too, without repeating the paid POST.
+        # reaches us. Reconcile for visibility; never delete any matching Pod.
         if api and ledger and entry and creation_attempted and not entry.get("pod_id"):
             print("Reconciling uncertain creation before exiting…", flush=True)
             try:
@@ -1251,7 +1128,7 @@ def local_main(argv=None):
                     if attempt < 2:
                         time.sleep(1)
             except AppError:
-                print("WARNING: Could not verify cleanup. Check Runpod Pods and run --stop before retrying.", file=sys.stderr)
+                print("WARNING: Could not verify Pod inventory. Check Runpod manually; no deletion was attempted.", file=sys.stderr)
         if app and not app.stopped.is_set() and (app.demo or (entry and entry.get("pod_id"))):
             app.end("Launcher closed")
         if server:
